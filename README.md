@@ -23,6 +23,7 @@ bpf/
   trawl_shared.h       # BPF/userspace ABI
 src/
   trawlctl.c           # controller, statistics, discovery, ELF attribution, delay backends
+  trawl_repl.c         # line-oriented REPL for changing controller arguments and rerunning
 shim/
   trawl_shim.c         # LD_PRELOAD pause-debt shim and progress marker functions
 include/
@@ -90,6 +91,59 @@ Run the smoke test:
 ```sh
 ./scripts/smoke-test.sh
 make docker-smoke
+```
+
+Run the line-oriented REPL when you want to change arguments and rerun without
+retyping the whole command:
+
+```sh
+docker run --rm --privileged --pid=host -it \
+  -v "$PWD":/src -w /src \
+  trawl-dev \
+  ./build/trawl repl \
+  --shim ./build/libtrawl_shim.so \
+  --binary ./examples/demo_server \
+  --symbol target_work \
+  --progress-id 1 \
+  --duration-ms 3000 \
+  --repeats 3 \
+  --speedups 0,10,25 \
+  -- ./examples/demo_server
+```
+
+You can also start with no controller arguments and let the REPL guide setup:
+
+```sh
+docker run --rm --privileged --pid=host -it \
+  -v "$PWD":/src -w /src \
+  trawl-dev \
+  ./build/trawl repl
+```
+
+Useful REPL commands:
+
+```text
+wizard
+suggest
+show
+args --lines
+set duration-ms 10000
+set repeats 20
+set speedups 0,5,10,25,50
+set latency-budget 5000
+unset latency
+programme ./examples/demo_server
+run
+results
+log 20
+quit
+```
+
+You can also replace the whole controller argument vector by editing and
+pasting the `show` output back into the prompt:
+
+```text
+args: --shim ./build/libtrawl_shim.so --binary ./examples/demo_server --symbol target_work --progress-id 1 --duration-ms 10000 --repeats 20 --speedups 0,5,10,25,50 -- ./examples/demo_server
 ```
 
 The run scripts use `--privileged --pid=host` and set `kernel.perf_event_paranoid=-1` inside the Docker Linux VM when permitted. This is needed for the perf-event and uprobe paths used by the profiler. On a normal Linux host, you can run the `build/trawl` commands directly with root or equivalent `CAP_BPF`/`CAP_PERFMON` privileges.

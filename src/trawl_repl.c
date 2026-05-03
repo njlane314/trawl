@@ -366,6 +366,14 @@ static void usage(FILE *f, const char *argv0)
         "  show                    print current controller path, args, and last status\n"
         "  core PATH               set controller executable\n"
         "  args [ARGS...]          show or replace controller arguments\n"
+        "  args --lines            print current arguments one per line\n"
+        "  args: [ARGS...]         replace arguments from a pasted show line\n"
+        "  wizard                  ask questions and build controller arguments\n"
+        "  suggest                 explain what is missing and useful next commands\n"
+        "  setup                   alias for wizard\n"
+        "  set OPTION VALUE        change one controller option\n"
+        "  unset OPTION            remove one controller option\n"
+        "  programme [ARGS...]     show or replace the command after --\n"
         "  preflight               run environment and argument checks\n"
         "  run [ARGS...]           optionally replace args, then run the controller\n"
         "  results                 print parsed summary rows and recent trials\n"
@@ -801,6 +809,7 @@ static int run_controller(struct repl_state *repl)
     print_preflight(repl);
     if (preflight_failed(repl)) {
         add_log(repl, "repl: preflight has blocking failures");
+        puts("preflight has blocking failures; run 'suggest' or 'wizard' to finish setup");
         return -1;
     }
 
@@ -948,6 +957,9 @@ static void print_shell_quoted(const char *s)
     putchar('\'');
 }
 
+static int pass_program_index(const struct repl_opts *opt);
+static int split_words(char *s, char **out, int max_words);
+
 static void print_args(const struct repl_opts *opt)
 {
     for (int i = 0; i < opt->pass_argc; i++) {
@@ -956,6 +968,712 @@ static void print_args(const struct repl_opts *opt)
         print_shell_quoted(opt->pass_argv[i]);
     }
     putchar('\n');
+}
+
+static void print_args_lines(const struct repl_opts *opt)
+{
+    int sep = pass_program_index(opt);
+    puts("controller arguments:");
+    for (int i = 0; i < opt->pass_argc; i++) {
+        if (i == sep) {
+            puts("  --");
+            puts("programme:");
+            continue;
+        }
+        printf("  [%02d] ", i);
+        print_shell_quoted(opt->pass_argv[i]);
+        putchar('\n');
+    }
+}
+
+static int pass_program_index(const struct repl_opts *opt)
+{
+    for (int i = 0; i < opt->pass_argc; i++)
+        if (strcmp(opt->pass_argv[i], "--") == 0)
+            return i;
+    return -1;
+}
+
+static int controller_option_takes_value(const char *opt)
+{
+    static const char *value_options[] = {
+        "--shim",
+        "--binary",
+        "--symbol",
+        "--range",
+        "--top-candidates",
+        "--progress-id",
+        "--latency-sample",
+        "--latency-budget",
+        "--duration-ms",
+        "--trial-timeout-ms",
+        "--warmup-ms",
+        "--cooldown-ms",
+        "--discover-ms",
+        "--repeats",
+        "--speedups",
+        "--seed",
+        "--pause-backend",
+        "--json",
+        "--trials-csv",
+        "--candidates-csv",
+        "--sample-ns",
+    };
+
+    for (size_t i = 0; i < ARRAY_LEN(value_options); i++)
+        if (strcmp(opt, value_options[i]) == 0)
+            return 1;
+    return 0;
+}
+
+static const char *canonical_controller_option(const char *key)
+{
+    struct alias {
+        const char *key;
+        const char *opt;
+    };
+    static const struct alias aliases[] = {
+        {"shim", "--shim"},
+        {"binary", "--binary"},
+        {"symbol", "--symbol"},
+        {"range", "--range"},
+        {"auto", "--auto"},
+        {"top", "--top-candidates"},
+        {"top-candidates", "--top-candidates"},
+        {"progress", "--progress-id"},
+        {"progress-id", "--progress-id"},
+        {"latency", "--latency"},
+        {"latency-sample", "--latency-sample"},
+        {"latency-budget", "--latency-budget"},
+        {"duration", "--duration-ms"},
+        {"duration-ms", "--duration-ms"},
+        {"timeout", "--trial-timeout-ms"},
+        {"trial-timeout", "--trial-timeout-ms"},
+        {"trial-timeout-ms", "--trial-timeout-ms"},
+        {"warmup", "--warmup-ms"},
+        {"warmup-ms", "--warmup-ms"},
+        {"cooldown", "--cooldown-ms"},
+        {"cooldown-ms", "--cooldown-ms"},
+        {"discover", "--discover-ms"},
+        {"discover-ms", "--discover-ms"},
+        {"repeats", "--repeats"},
+        {"speedups", "--speedups"},
+        {"seed", "--seed"},
+        {"backend", "--pause-backend"},
+        {"pause-backend", "--pause-backend"},
+        {"json", "--json"},
+        {"trials", "--trials-csv"},
+        {"trials-csv", "--trials-csv"},
+        {"candidates", "--candidates-csv"},
+        {"candidates-csv", "--candidates-csv"},
+        {"sample", "--sample-ns"},
+        {"sample-ns", "--sample-ns"},
+        {"emit-progress-events", "--emit-progress-events"},
+    };
+
+    if (strncmp(key, "--", 2) == 0)
+        return key;
+    for (size_t i = 0; i < ARRAY_LEN(aliases); i++)
+        if (strcmp(key, aliases[i].key) == 0)
+            return aliases[i].opt;
+    return NULL;
+}
+
+static int truth_value(const char *s, int *out)
+{
+    if (strcmp(s, "1") == 0 || strcmp(s, "on") == 0 || strcmp(s, "true") == 0 ||
+        strcmp(s, "yes") == 0 || strcmp(s, "enabled") == 0) {
+        *out = 1;
+        return 0;
+    }
+    if (strcmp(s, "0") == 0 || strcmp(s, "off") == 0 || strcmp(s, "false") == 0 ||
+        strcmp(s, "no") == 0 || strcmp(s, "disabled") == 0) {
+        *out = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static int temp_arg_add(char **tmp, int *n, const char *s)
+{
+    if (*n >= REPL_MAX_ARGS - 1)
+        return -1;
+    tmp[*n] = strdup(s);
+    if (!tmp[*n])
+        return -1;
+    (*n)++;
+    tmp[*n] = NULL;
+    return 0;
+}
+
+static void temp_args_free(char **tmp, int n)
+{
+    for (int i = 0; i < n; i++)
+        free(tmp[i]);
+}
+
+static int option_in_list(const char *arg, const char **opts, int nopts)
+{
+    for (int i = 0; i < nopts; i++)
+        if (strcmp(arg, opts[i]) == 0)
+            return 1;
+    return 0;
+}
+
+static int replace_controller_options(struct repl_opts *opt,
+                                      const char **remove_opts, int remove_count,
+                                      const char **add_args, int add_count)
+{
+    char *tmp[REPL_MAX_ARGS] = {0};
+    int n = 0;
+    int sep = pass_program_index(opt);
+    int inserted = 0;
+
+    for (int i = 0; i < opt->pass_argc; i++) {
+        if (i == sep && !inserted) {
+            for (int j = 0; j < add_count; j++)
+                if (temp_arg_add(tmp, &n, add_args[j]) != 0)
+                    goto oom;
+            inserted = 1;
+        }
+
+        if ((sep < 0 || i < sep) && option_in_list(opt->pass_argv[i], remove_opts, remove_count)) {
+            if (controller_option_takes_value(opt->pass_argv[i]) && i + 1 < opt->pass_argc &&
+                (sep < 0 || i + 1 < sep))
+                i++;
+            continue;
+        }
+
+        if (temp_arg_add(tmp, &n, opt->pass_argv[i]) != 0)
+            goto oom;
+    }
+
+    if (!inserted) {
+        for (int j = 0; j < add_count; j++)
+            if (temp_arg_add(tmp, &n, add_args[j]) != 0)
+                goto oom;
+    }
+
+    int rc = set_pass_args(opt, n, tmp);
+    temp_args_free(tmp, n);
+    return rc;
+
+oom:
+    temp_args_free(tmp, n);
+    fprintf(stderr, "trawl-repl: too many arguments or out of memory\n");
+    return -1;
+}
+
+static int set_programme_args(struct repl_opts *opt, int argc, char **argv)
+{
+    char *tmp[REPL_MAX_ARGS] = {0};
+    int n = 0;
+    int sep = pass_program_index(opt);
+    int limit = sep >= 0 ? sep : opt->pass_argc;
+
+    for (int i = 0; i < limit; i++)
+        if (temp_arg_add(tmp, &n, opt->pass_argv[i]) != 0)
+            goto oom;
+
+    if (argc > 0) {
+        if (temp_arg_add(tmp, &n, "--") != 0)
+            goto oom;
+        for (int i = 0; i < argc; i++)
+            if (temp_arg_add(tmp, &n, argv[i]) != 0)
+                goto oom;
+    }
+
+    int rc = set_pass_args(opt, n, tmp);
+    temp_args_free(tmp, n);
+    return rc;
+
+oom:
+    temp_args_free(tmp, n);
+    fprintf(stderr, "trawl-repl: too many arguments or out of memory\n");
+    return -1;
+}
+
+static void print_programme_args(const struct repl_opts *opt)
+{
+    int sep = pass_program_index(opt);
+    if (sep < 0 || sep + 1 >= opt->pass_argc) {
+        puts("(none)");
+        return;
+    }
+
+    for (int i = sep + 1; i < opt->pass_argc; i++) {
+        if (i > sep + 1)
+            putchar(' ');
+        print_shell_quoted(opt->pass_argv[i]);
+    }
+    putchar('\n');
+}
+
+static int set_controller_arg(struct repl_opts *opt, int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "usage: set OPTION VALUE\n");
+        return -1;
+    }
+
+    const char *key = argv[0];
+    if (strcmp(key, "program") == 0 || strcmp(key, "programme") == 0)
+        return set_programme_args(opt, argc - 1, &argv[1]);
+
+    if (strcmp(key, "mode") == 0 || strcmp(key, "target") == 0) {
+        if (argc < 2) {
+            fprintf(stderr, "usage: set %s symbol NAME | range LO-HI | auto [N]\n", key);
+            return -1;
+        }
+        key = argv[1];
+        argv++;
+        argc--;
+    }
+
+    const char *mode_opts[] = {"--symbol", "--range", "--auto", "--top-candidates"};
+    if (strcmp(key, "symbol") == 0 || strcmp(key, "--symbol") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "usage: set symbol NAME\n");
+            return -1;
+        }
+        const char *add[] = {"--symbol", argv[1]};
+        return replace_controller_options(opt, mode_opts, ARRAY_LEN(mode_opts), add, ARRAY_LEN(add));
+    }
+
+    if (strcmp(key, "range") == 0 || strcmp(key, "--range") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "usage: set range LO-HI\n");
+            return -1;
+        }
+        const char *add[] = {"--range", argv[1]};
+        return replace_controller_options(opt, mode_opts, ARRAY_LEN(mode_opts), add, ARRAY_LEN(add));
+    }
+
+    if (strcmp(key, "auto") == 0 || strcmp(key, "--auto") == 0) {
+        const char *add_auto[] = {"--auto"};
+        if (argc == 1)
+            return replace_controller_options(opt, mode_opts, ARRAY_LEN(mode_opts), add_auto, ARRAY_LEN(add_auto));
+        int enabled;
+        if (truth_value(argv[1], &enabled) == 0) {
+            if (!enabled)
+                return replace_controller_options(opt, mode_opts, ARRAY_LEN(mode_opts), NULL, 0);
+            return replace_controller_options(opt, mode_opts, ARRAY_LEN(mode_opts), add_auto, ARRAY_LEN(add_auto));
+        }
+        const char *add_top[] = {"--auto", "--top-candidates", argv[1]};
+        return replace_controller_options(opt, mode_opts, ARRAY_LEN(mode_opts), add_top, ARRAY_LEN(add_top));
+    }
+
+    const char *latency_opts[] = {"--latency", "--latency-sample", "--latency-budget"};
+    if (strcmp(key, "latency") == 0 || strcmp(key, "--latency") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "usage: set latency on|off\n");
+            return -1;
+        }
+        int enabled;
+        if (truth_value(argv[1], &enabled) != 0) {
+            fprintf(stderr, "set latency: expected on or off\n");
+            return -1;
+        }
+        if (!enabled)
+            return replace_controller_options(opt, latency_opts, ARRAY_LEN(latency_opts), NULL, 0);
+        const char *add[] = {"--latency"};
+        return replace_controller_options(opt, latency_opts, ARRAY_LEN(latency_opts), add, ARRAY_LEN(add));
+    }
+
+    if (strcmp(key, "latency-budget") == 0 || strcmp(key, "--latency-budget") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "usage: set latency-budget N\n");
+            return -1;
+        }
+        const char *add[] = {"--latency-budget", argv[1]};
+        return replace_controller_options(opt, latency_opts, ARRAY_LEN(latency_opts), add, ARRAY_LEN(add));
+    }
+
+    if (strcmp(key, "latency-sample") == 0 || strcmp(key, "--latency-sample") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "usage: set latency-sample N\n");
+            return -1;
+        }
+        const char *add[] = {"--latency-sample", argv[1]};
+        return replace_controller_options(opt, latency_opts, ARRAY_LEN(latency_opts), add, ARRAY_LEN(add));
+    }
+
+    const char *opt_name = canonical_controller_option(key);
+    if (!opt_name) {
+        fprintf(stderr, "unknown option: %s\n", key);
+        return -1;
+    }
+
+    const char *remove[] = {opt_name};
+    if (controller_option_takes_value(opt_name)) {
+        if (argc != 2) {
+            fprintf(stderr, "usage: set %s VALUE\n", key);
+            return -1;
+        }
+        const char *add[] = {opt_name, argv[1]};
+        return replace_controller_options(opt, remove, ARRAY_LEN(remove), add, ARRAY_LEN(add));
+    }
+
+    if (argc > 2) {
+        fprintf(stderr, "usage: set %s [on|off]\n", key);
+        return -1;
+    }
+    if (argc == 2) {
+        int enabled;
+        if (truth_value(argv[1], &enabled) != 0) {
+            fprintf(stderr, "set %s: expected on or off\n", key);
+            return -1;
+        }
+        if (!enabled)
+            return replace_controller_options(opt, remove, ARRAY_LEN(remove), NULL, 0);
+    }
+    const char *add[] = {opt_name};
+    return replace_controller_options(opt, remove, ARRAY_LEN(remove), add, ARRAY_LEN(add));
+}
+
+static int unset_controller_arg(struct repl_opts *opt, const char *key)
+{
+    if (strcmp(key, "program") == 0 || strcmp(key, "programme") == 0)
+        return set_programme_args(opt, 0, NULL);
+
+    const char *mode_opts[] = {"--symbol", "--range", "--auto", "--top-candidates"};
+    if (strcmp(key, "mode") == 0 || strcmp(key, "target") == 0 ||
+        strcmp(key, "symbol") == 0 || strcmp(key, "range") == 0 ||
+        strcmp(key, "auto") == 0 || strcmp(key, "top") == 0 ||
+        strcmp(key, "top-candidates") == 0)
+        return replace_controller_options(opt, mode_opts, ARRAY_LEN(mode_opts), NULL, 0);
+
+    const char *latency_opts[] = {"--latency", "--latency-sample", "--latency-budget"};
+    if (strcmp(key, "latency") == 0)
+        return replace_controller_options(opt, latency_opts, ARRAY_LEN(latency_opts), NULL, 0);
+
+    const char *opt_name = canonical_controller_option(key);
+    if (!opt_name) {
+        fprintf(stderr, "unknown option: %s\n", key);
+        return -1;
+    }
+    const char *remove[] = {opt_name};
+    return replace_controller_options(opt, remove, ARRAY_LEN(remove), NULL, 0);
+}
+
+static const char *existing_path_or_default(const char *current, const char *fallback)
+{
+    if (current && *current)
+        return current;
+    return fallback;
+}
+
+static void prompt_default(const char *label, const char *def, char *out, size_t out_len)
+{
+    char def_copy[REPL_MAX_LINE];
+    snprintf(def_copy, sizeof(def_copy), "%s", def ? def : "");
+
+    printf("%s", label);
+    if (*def_copy)
+        printf(" [%s]", def_copy);
+    printf(": ");
+    fflush(stdout);
+
+    if (!fgets(out, out_len, stdin)) {
+        out[0] = 0;
+        return;
+    }
+    trim_line(out);
+    if (!*out)
+        snprintf(out, out_len, "%s", def_copy);
+}
+
+static int prompt_yesno(const char *label, int def)
+{
+    char answer[32];
+    for (;;) {
+        printf("%s [%s]: ", label, def ? "yes" : "no");
+        fflush(stdout);
+        if (!fgets(answer, sizeof(answer), stdin))
+            return def;
+        trim_line(answer);
+        if (!*answer)
+            return def;
+        int value;
+        if (truth_value(answer, &value) == 0)
+            return value;
+        puts("Please answer yes or no.");
+    }
+}
+
+static void first_programme_word(const struct repl_opts *opt, char *out, size_t out_len)
+{
+    int sep = pass_program_index(opt);
+    if (sep >= 0 && sep + 1 < opt->pass_argc) {
+        snprintf(out, out_len, "%s", opt->pass_argv[sep + 1]);
+        return;
+    }
+    out[0] = 0;
+}
+
+static void default_binary_for_programme(const char *programme, char *out, size_t out_len)
+{
+    char work[REPL_MAX_LINE];
+    char *argv[REPL_MAX_ARGS];
+    snprintf(work, sizeof(work), "%s", programme ? programme : "");
+    int argc = split_words(work, argv, REPL_MAX_ARGS);
+    if (argc <= 0) {
+        out[0] = 0;
+        return;
+    }
+    if (has_slash(argv[0]) || is_exec_file(argv[0])) {
+        snprintf(out, out_len, "%s", argv[0]);
+        return;
+    }
+    char found[REPL_PATH_MAX];
+    if (find_in_path(argv[0], found, sizeof(found)) == 0)
+        snprintf(out, out_len, "%s", found);
+    else
+        snprintf(out, out_len, "%s", argv[0]);
+}
+
+static void print_suggestions(const struct repl_state *repl)
+{
+    const struct parsed_profile *p = &repl->opt.profile;
+
+    puts("suggestions:");
+    if (!p->shim) {
+        if (is_readable_file("./build/libtrawl_shim.so"))
+            puts("  set shim ./build/libtrawl_shim.so");
+        else
+            puts("  build first, then set shim ./build/libtrawl_shim.so");
+    }
+    if (!p->program) {
+        if (is_exec_file("./examples/demo_server"))
+            puts("  programme ./examples/demo_server");
+        else
+            puts("  programme ./path/to/your_server --flag value");
+    }
+    if (!p->binary) {
+        if (p->program)
+            puts("  set binary PATH_TO_THE_ELF_OR_SHARED_OBJECT_WITH_THE_TARGET_SYMBOL");
+        else if (is_exec_file("./examples/demo_server"))
+            puts("  set binary ./examples/demo_server");
+    }
+    if (p->valid_mode_count != 1) {
+        if (is_exec_file("./examples/demo_server"))
+            puts("  set symbol target_work");
+        puts("  or: set mode auto 5");
+    }
+    if (!p->json)
+        puts("  set json reports/repl.json");
+    if (!p->trials_csv)
+        puts("  set trials-csv reports/repl-trials.csv");
+    if (!p->candidates_csv)
+        puts("  set candidates-csv reports/repl-candidates.csv");
+
+    puts("  wizard");
+    puts("  preflight");
+    puts("  run");
+}
+
+static int add_wizard_arg(char **tmp, int *n, const char *s)
+{
+    return temp_arg_add(tmp, n, s);
+}
+
+static int run_wizard(struct repl_state *repl)
+{
+    if (!isatty(STDIN_FILENO)) {
+        fprintf(stderr, "wizard requires interactive input; use set, programme, or args: in scripts\n");
+        return -1;
+    }
+
+    const struct parsed_profile *p = &repl->opt.profile;
+    char shim[REPL_PATH_MAX];
+    char programme[REPL_MAX_LINE];
+    char binary[REPL_PATH_MAX];
+    char mode[32];
+    char target[REPL_PATH_MAX];
+    char top_candidates[32];
+    char progress_id[32];
+    char duration_ms[32];
+    char warmup_ms[32];
+    char cooldown_ms[32];
+    char repeats[32];
+    char speedups[256];
+    char latency_budget[32];
+    char sample_ns[32];
+    char report_prefix[REPL_PATH_MAX - 64];
+
+    puts("Trawl setup wizard");
+    puts("Press Enter to accept defaults. Use 'auto' target mode if you do not know the hot function yet.");
+
+    const char *shim_default = existing_path_or_default(p->shim, "./build/libtrawl_shim.so");
+    prompt_default("LD_PRELOAD shim", shim_default, shim, sizeof(shim));
+
+    char current_programme[REPL_MAX_LINE];
+    first_programme_word(&repl->opt, current_programme, sizeof(current_programme));
+    if (!*current_programme && is_exec_file("./examples/demo_server"))
+        snprintf(current_programme, sizeof(current_programme), "./examples/demo_server");
+    prompt_default("Programme command", current_programme, programme, sizeof(programme));
+
+    char binary_default[REPL_PATH_MAX];
+    if (p->binary && *p->binary)
+        snprintf(binary_default, sizeof(binary_default), "%s", p->binary);
+    else
+        default_binary_for_programme(programme, binary_default, sizeof(binary_default));
+    if (!*binary_default && is_exec_file("./examples/demo_server"))
+        snprintf(binary_default, sizeof(binary_default), "./examples/demo_server");
+    prompt_default("Binary or shared object to profile", binary_default, binary, sizeof(binary));
+
+    const char *mode_default = p->auto_candidates ? "auto" : (p->range ? "range" : "symbol");
+    if (!p->auto_candidates && !p->range && !p->symbol && strcmp(binary, "./examples/demo_server") != 0)
+        mode_default = "auto";
+    prompt_default("Target mode: symbol, range, or auto", mode_default, mode, sizeof(mode));
+    for (char *c = mode; *c; c++)
+        *c = (char)tolower((unsigned char)*c);
+
+    target[0] = 0;
+    if (strcmp(mode, "symbol") == 0) {
+        const char *symbol_default = p->symbol ? p->symbol :
+            (strcmp(binary, "./examples/demo_server") == 0 ? "target_work" : "");
+        prompt_default("Symbol name", symbol_default, target, sizeof(target));
+    } else if (strcmp(mode, "range") == 0) {
+        prompt_default("Runtime address range LO-HI", p->range ? p->range : "", target, sizeof(target));
+    } else if (strcmp(mode, "auto") != 0) {
+        fprintf(stderr, "wizard: unknown target mode '%s'\n", mode);
+        return -1;
+    } else {
+        snprintf(top_candidates, sizeof(top_candidates), "%d", p->top_candidates > 1 ? p->top_candidates : 5);
+        prompt_default("Auto candidates", top_candidates, top_candidates, sizeof(top_candidates));
+    }
+
+    snprintf(progress_id, sizeof(progress_id), "%d", p->progress_id ? p->progress_id : 1);
+    prompt_default("Progress id", progress_id, progress_id, sizeof(progress_id));
+
+    snprintf(duration_ms, sizeof(duration_ms), "%d", p->duration_ms ? p->duration_ms : 3000);
+    prompt_default("Trial duration ms", duration_ms, duration_ms, sizeof(duration_ms));
+
+    snprintf(warmup_ms, sizeof(warmup_ms), "%d", p->warmup_ms);
+    prompt_default("Warmup ms", warmup_ms, warmup_ms, sizeof(warmup_ms));
+
+    snprintf(cooldown_ms, sizeof(cooldown_ms), "%d", p->cooldown_ms);
+    prompt_default("Cooldown ms", cooldown_ms, cooldown_ms, sizeof(cooldown_ms));
+
+    snprintf(repeats, sizeof(repeats), "%d", p->repeats ? p->repeats : 3);
+    prompt_default("Repeats", repeats, repeats, sizeof(repeats));
+
+    prompt_default("Speedups", p->speedups ? p->speedups : "0,10,25", speedups, sizeof(speedups));
+
+    int latency = prompt_yesno("Track sampled latency", p->latency || repl->opt.pass_argc == 0);
+    if (latency)
+        prompt_default("Latency sample budget per second", "5000", latency_budget, sizeof(latency_budget));
+    else
+        latency_budget[0] = 0;
+
+    prompt_default("CPU sample period ns", "1000000", sample_ns, sizeof(sample_ns));
+    prompt_default("Report prefix", "reports/repl", report_prefix, sizeof(report_prefix));
+
+    char json[REPL_PATH_MAX];
+    char trials_csv[REPL_PATH_MAX];
+    char candidates_csv[REPL_PATH_MAX];
+    snprintf(json, sizeof(json), "%s.json", report_prefix);
+    snprintf(trials_csv, sizeof(trials_csv), "%s-trials.csv", report_prefix);
+    snprintf(candidates_csv, sizeof(candidates_csv), "%s-candidates.csv", report_prefix);
+
+    char *programme_tmp = strdup(programme);
+    if (!programme_tmp) {
+        fprintf(stderr, "wizard: out of memory\n");
+        return -1;
+    }
+    char *programme_argv[REPL_MAX_ARGS];
+    int programme_argc = split_words(programme_tmp, programme_argv, REPL_MAX_ARGS);
+    if (programme_argc <= 0) {
+        free(programme_tmp);
+        fprintf(stderr, "wizard: programme command is required\n");
+        return -1;
+    }
+
+    char *tmp[REPL_MAX_ARGS] = {0};
+    int n = 0;
+    if (add_wizard_arg(tmp, &n, "--shim") != 0 ||
+        add_wizard_arg(tmp, &n, shim) != 0 ||
+        add_wizard_arg(tmp, &n, "--binary") != 0 ||
+        add_wizard_arg(tmp, &n, binary) != 0)
+        goto oom;
+
+    if (strcmp(mode, "symbol") == 0) {
+        if (!*target) {
+            fprintf(stderr, "wizard: symbol target is required\n");
+            goto fail;
+        }
+        if (add_wizard_arg(tmp, &n, "--symbol") != 0 ||
+            add_wizard_arg(tmp, &n, target) != 0)
+            goto oom;
+    } else if (strcmp(mode, "range") == 0) {
+        if (!*target) {
+            fprintf(stderr, "wizard: range target is required\n");
+            goto fail;
+        }
+        if (add_wizard_arg(tmp, &n, "--range") != 0 ||
+            add_wizard_arg(tmp, &n, target) != 0)
+            goto oom;
+    } else {
+        if (add_wizard_arg(tmp, &n, "--auto") != 0 ||
+            add_wizard_arg(tmp, &n, "--top-candidates") != 0 ||
+            add_wizard_arg(tmp, &n, top_candidates) != 0)
+            goto oom;
+    }
+
+    const char *fixed_args[] = {
+        "--progress-id", progress_id,
+        "--duration-ms", duration_ms,
+        "--warmup-ms", warmup_ms,
+        "--cooldown-ms", cooldown_ms,
+        "--repeats", repeats,
+        "--speedups", speedups,
+        "--sample-ns", sample_ns,
+        "--json", json,
+        "--trials-csv", trials_csv,
+        "--candidates-csv", candidates_csv,
+    };
+    for (size_t i = 0; i < ARRAY_LEN(fixed_args); i++)
+        if (add_wizard_arg(tmp, &n, fixed_args[i]) != 0)
+            goto oom;
+
+    if (latency && (add_wizard_arg(tmp, &n, "--latency-budget") != 0 ||
+                    add_wizard_arg(tmp, &n, latency_budget) != 0))
+        goto oom;
+
+    if (add_wizard_arg(tmp, &n, "--") != 0)
+        goto oom;
+    for (int i = 0; i < programme_argc; i++)
+        if (add_wizard_arg(tmp, &n, programme_argv[i]) != 0)
+            goto oom;
+
+    int rc = set_pass_args(&repl->opt, n, tmp);
+    temp_args_free(tmp, n);
+    free(programme_tmp);
+    if (rc == 0) {
+        puts("Configured controller arguments:");
+        print_args_lines(&repl->opt);
+        puts("Next: run 'preflight', then 'run'.");
+    }
+    return rc;
+
+oom:
+    fprintf(stderr, "wizard: too many arguments or out of memory\n");
+fail:
+    temp_args_free(tmp, n);
+    free(programme_tmp);
+    return -1;
+}
+
+static void print_welcome(const struct repl_state *repl)
+{
+    puts("Trawl REPL");
+    if (repl->opt.pass_argc == 0) {
+        puts("No profiling target is configured yet.");
+        puts("Start with 'wizard', or use 'suggest' for manual setup commands.");
+    } else {
+        puts("Type 'show' to inspect the current run, 'set' to change one option, or 'run'.");
+    }
 }
 
 static void print_show(const struct repl_state *repl)
@@ -1073,6 +1791,17 @@ static void print_command_help(void)
     puts("  show                    print controller path, current args, and last status");
     puts("  core PATH               set the controller executable");
     puts("  args [ARGS...]          show or replace the controller argument vector");
+    puts("  args --lines            print current arguments one per line");
+    puts("  args: [ARGS...]         replace arguments from a pasted show line");
+    puts("  wizard                  ask questions and build controller arguments");
+    puts("  setup                   alias for wizard");
+    puts("  suggest                 explain what is missing and useful next commands");
+    puts("  set OPTION VALUE        change one controller option");
+    puts("                          examples: set duration-ms 5000, set speedups 0,5,10");
+    puts("                          set symbol target_work, set latency-budget 3000");
+    puts("  unset OPTION            remove an option; examples: unset latency, unset target");
+    puts("  programme [ARGS...]     show or replace the command after --");
+    puts("  program [ARGS...]       alias for programme");
     puts("  preflight               run checks without starting the controller");
     puts("  run [ARGS...]           optionally replace args, then run the controller");
     puts("  results                 print parsed summaries and recent trials");
@@ -1087,6 +1816,9 @@ static int repl_loop(struct repl_state *repl)
     char work[REPL_MAX_LINE];
     char *argv[REPL_MAX_ARGS];
     int interactive = isatty(STDIN_FILENO);
+
+    if (interactive)
+        print_welcome(repl);
 
     while (1) {
         if (interactive) {
@@ -1123,11 +1855,30 @@ static int repl_loop(struct repl_state *repl)
             }
             if (set_core_path(&repl->opt, argv[1]) != 0)
                 fprintf(stderr, "core: out of memory\n");
-        } else if (strcmp(cmd, "args") == 0) {
+        } else if (strcmp(cmd, "args") == 0 || strcmp(cmd, "args:") == 0) {
             if (argc == 1)
                 print_args(&repl->opt);
+            else if (strcmp(argv[1], "--lines") == 0 || strcmp(argv[1], "-l") == 0)
+                print_args_lines(&repl->opt);
             else
                 (void)set_pass_args(&repl->opt, argc - 1, &argv[1]);
+        } else if (strcmp(cmd, "wizard") == 0 || strcmp(cmd, "setup") == 0) {
+            (void)run_wizard(repl);
+        } else if (strcmp(cmd, "suggest") == 0 || strcmp(cmd, "suggestions") == 0) {
+            print_suggestions(repl);
+        } else if (strcmp(cmd, "set") == 0) {
+            (void)set_controller_arg(&repl->opt, argc - 1, &argv[1]);
+        } else if (strcmp(cmd, "unset") == 0) {
+            if (argc != 2) {
+                fprintf(stderr, "usage: unset OPTION\n");
+                continue;
+            }
+            (void)unset_controller_arg(&repl->opt, argv[1]);
+        } else if (strcmp(cmd, "programme") == 0 || strcmp(cmd, "program") == 0) {
+            if (argc == 1)
+                print_programme_args(&repl->opt);
+            else
+                (void)set_programme_args(&repl->opt, argc - 1, &argv[1]);
         } else if (strcmp(cmd, "preflight") == 0 || strcmp(cmd, "check") == 0) {
             run_preflight(repl);
             print_preflight(repl);
