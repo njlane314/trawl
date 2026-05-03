@@ -110,7 +110,10 @@ Common run-script overrides:
 DURATION_MS=10000 REPEATS=20 SPEEDUPS=0,5,10,25,50 ./scripts/run-demo.sh
 TOP_CANDIDATES=10 DISCOVER_MS=5000 REPEATS=10 ./scripts/run-auto.sh
 SEED=42 ./scripts/run-demo.sh
+LATENCY=0 DURATION_MS=10000 REPEATS=20 SAMPLE_NS=1000000 ./scripts/run-demo.sh
 ```
+
+Use `LATENCY=0` for long throughput-only runs. The default `LATENCY=1` records begin/end marker events and reports latency quantiles, which is useful but can create high event volume on very fast workloads.
 
 Compare against a workload where sleeping dominates the request:
 

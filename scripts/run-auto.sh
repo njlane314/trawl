@@ -15,6 +15,7 @@ SAMPLE_NS="${SAMPLE_NS:-100000}"
 TOP_CANDIDATES="${TOP_CANDIDATES:-5}"
 REPORT_DIR="${REPORT_DIR:-reports}"
 REPORT_NAME="${REPORT_NAME:-auto}"
+LATENCY="${LATENCY:-1}"
 SEED="${SEED:-}"
 
 "$ROOT_DIR/scripts/docker-build.sh"
@@ -31,12 +32,17 @@ docker run --rm --privileged --pid=host \
     if [[ -n "${12}" ]]; then
       seed_args=(--seed "${12}")
     fi
+    latency_args=()
+    case "${14}" in
+      0|false|False|FALSE|no|No|NO|off|Off|OFF) ;;
+      *) latency_args=(--latency) ;;
+    esac
     exec ./build/trawl \
       --shim ./build/libtrawl_shim.so \
       --auto \
       --top-candidates "$1" \
       --progress-id 1 \
-      --latency \
+      "${latency_args[@]}" \
       --duration-ms "$2" \
       --warmup-ms "$3" \
       --cooldown-ms "$4" \
@@ -62,4 +68,5 @@ docker run --rm --privileged --pid=host \
     "$REPORT_DIR/$REPORT_NAME-trials.csv" \
     "$REPORT_DIR/$REPORT_NAME-candidates.csv" \
     "$SEED" \
-    "$TARGET_COMMAND"
+    "$TARGET_COMMAND" \
+    "$LATENCY"
