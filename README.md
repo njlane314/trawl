@@ -29,6 +29,10 @@ include/
   trawl_shm.h          # shared-memory pause-debt table
 examples/
   demo_server.c      # toy multithreaded workload with throughput and latency markers
+scripts/
+  docker-build.sh    # build Linux artifacts in the Docker image
+  run-demo.sh        # run a targeted target_work causal profile
+  run-auto.sh        # run auto-discovery against the demo workload
 ```
 
 ## Build requirements
@@ -53,6 +57,36 @@ make examples
 ```
 
 On macOS, build inside a Linux environment such as Docker or on a Linux host. The Makefile uses kernel BTF from `/sys/kernel/btf/vmlinux` when available and falls back to the minimal bundled header for compile-only environments.
+
+## Docker quick start
+
+Build the Linux container image and artifacts:
+
+```sh
+./scripts/docker-build.sh
+```
+
+Run a targeted demo experiment against `target_work`:
+
+```sh
+./scripts/run-demo.sh
+```
+
+Run auto-discovery against the demo workload:
+
+```sh
+./scripts/run-auto.sh
+```
+
+The run scripts use `--privileged --pid=host` and set `kernel.perf_event_paranoid=-1` inside the Docker Linux VM when permitted. This is needed for the perf-event and uprobe paths used by the profiler. On a normal Linux host, you can run the `build/trawl` commands directly with root or equivalent `CAP_BPF`/`CAP_PERFMON` privileges.
+
+Common run-script overrides:
+
+```sh
+DURATION_MS=10000 REPEATS=20 SPEEDUPS=0,5,10,25,50 ./scripts/run-demo.sh
+TOP_CANDIDATES=10 DISCOVER_MS=5000 REPEATS=10 ./scripts/run-auto.sh
+SEED=42 ./scripts/run-demo.sh
+```
 
 ## Throughput markers
 
