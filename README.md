@@ -1,10 +1,10 @@
 # Trawl
 
-This repository is a production-shaped Coz-style causal profiler. eBPF is used for low-overhead observation; a user-space controller runs randomized virtual-speedup experiments; an `LD_PRELOAD` shim implements cooperative pause debt and progress markers.
+This repository is a production-shaped Coz-style causal profiler. eBPF is used for low-overhead observation; a user-space controller runs randomised virtual-speedup experiments; an `LD_PRELOAD` shim implements cooperative pause debt and progress markers.
 
 The current version includes the production upgrades that were missing from the first prototype:
 
-- randomized repeated trials per candidate/speedup;
+- randomised repeated trials per candidate/speedup;
 - 95% confidence intervals for rate and impact estimates;
 - latency begin/end tracking with token-correlated request ids and p50/p90/p99 reporting;
 - auto-discovery of hot function candidates from the BPF sample histogram;
@@ -198,7 +198,7 @@ Summary rows:
 summary_type,candidate_idx,name,speedup_pct,n,rate_mean,rate_ci95_low,rate_ci95_high,impact_pct,impact_ci95_low,impact_ci95_high,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms
 ```
 
-`impact_pct` estimates the application-level throughput effect of virtually speeding up that candidate by the given percentage. The confidence interval is computed on the log rate ratio using the repeated randomized trials.
+`impact_pct` estimates the application-level throughput effect of virtually speeding up that candidate by the given percentage. The confidence interval is computed on the log rate ratio using the repeated randomised trials.
 
 ## Interpretation constraints
 

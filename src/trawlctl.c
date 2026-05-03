@@ -243,9 +243,9 @@ static void usage(const char *argv0)
         "  --warmup-ms N           warmup before discovery/trials; default: 1000\n"
         "  --cooldown-ms N         drain pause debt after each trial; default: 200\n"
         "  --discover-ms N         auto-discovery sampling window; default: 3000\n"
-        "  --repeats N             repeated randomized trials per candidate/speedup; default: 3\n"
+        "  --repeats N             repeated randomised trials per candidate/speedup; default: 3\n"
         "  --speedups CSV          percentages, e.g. 0,5,10,25,50; default: 0,10,25,50,75\n"
-        "  --seed N                randomization seed; default: monotonic time\n"
+        "  --seed N                randomisation seed; default: monotonic time\n"
         "  --no-randomize          run the trial grid deterministically\n\n"
         "runtime/control:\n"
         "  --sample-ns N           CPU-clock sample period; default: 1000000\n"
@@ -2043,7 +2043,7 @@ int main(int argc, char **argv)
 
     struct delay_backend delay;
     if (delay_backend_init(&delay, opt.pause_backend, child, shm) != 0) {
-        fprintf(stderr, "failed to initialize delay backend\n");
+        fprintf(stderr, "failed to initialise delay backend\n");
         for (size_t i = 0; i < ARRAY_LEN(uprobe_links); i++)
             if (uprobe_links[i]) bpf_link__destroy(uprobe_links[i]);
         destroy_perf_links(perf_links, perf_fds, nperf);
