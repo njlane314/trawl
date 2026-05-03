@@ -60,6 +60,7 @@ struct options {
     uint32_t progress_id;
     uint64_t sample_period_ns;
     int duration_ms;
+    int trial_timeout_ms;
     int warmup_ms;
     int cooldown_ms;
     int discover_ms;
@@ -168,6 +169,7 @@ struct trial_result {
     uint64_t virtual_delay_ns;
     uint64_t target_hits;
     uint32_t latency_sample_rate;
+    int timed_out;
     double rate_per_sec;
     struct latency_snapshot latency;
 };
@@ -198,6 +200,8 @@ struct run_state {
     struct latency_tracker latency;
     struct trial_result *current;
     uint64_t epoch;
+    uint64_t trial_deadline_ns;
+    int trial_timed_out;
 };
 
 static struct elf_image g_images[TRAWL_MAX_IMAGES];
@@ -246,6 +250,7 @@ static void usage(const char *argv0)
         "  --latency-budget N      adapt latency sampling towards N spans/sec; implies --latency\n\n"
         "experiment design:\n"
         "  --duration-ms N         duration per trial; default: 5000\n"
+        "  --trial-timeout-ms N    hard wall-clock watchdog per trial; default: derived from duration\n"
         "  --warmup-ms N           warmup before discovery/trials; default: 1000\n"
         "  --cooldown-ms N         drain pause debt after each trial; default: 200\n"
         "  --discover-ms N         auto-discovery sampling window; default: 3000\n"
@@ -411,6 +416,8 @@ static int parse_args(int argc, char **argv, struct options *opt)
             opt->progress_id = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--duration-ms") == 0 && i + 1 < argc) {
             opt->duration_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--trial-timeout-ms") == 0 && i + 1 < argc) {
+            opt->trial_timeout_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup-ms") == 0 && i + 1 < argc) {
             opt->warmup_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cooldown-ms") == 0 && i + 1 < argc) {
@@ -474,6 +481,14 @@ static int parse_args(int argc, char **argv, struct options *opt)
         return -1;
     if (opt->duration_ms <= 0 || opt->sample_period_ns == 0 || opt->repeats <= 0)
         return -1;
+    if (opt->trial_timeout_ms < 0)
+        return -1;
+    if (opt->trial_timeout_ms == 0) {
+        int margin = opt->duration_ms * 2;
+        if (margin < 30000)
+            margin = 30000;
+        opt->trial_timeout_ms = opt->duration_ms + margin;
+    }
     if (opt->latency_sample_rate == 0)
         return -1;
     if (opt->latency_sample_set && opt->latency_budget_per_sec)
@@ -1062,7 +1077,7 @@ static int collect_candidates_from_hist(pid_t pid, int sample_map_fd,
 static int update_config(struct trawl_bpf *skel, const struct trawl_config *cfg)
 {
     uint32_t zero = 0;
-    int fd = bpf_map__fd(skel->maps.config);
+    int fd = bpf_map__fd(skel->maps.trawl_config_map);
     return bpf_map_update_elem(fd, &zero, cfg, BPF_ANY);
 }
 
@@ -1516,7 +1531,13 @@ static int on_event(void *ctx, void *data, size_t data_sz)
     struct run_state *st = ctx;
     const struct trawl_event *ev = data;
 
-    if (!st->current || ev->epoch != st->epoch)
+    if (!st->current)
+        return 0;
+    if (st->trial_deadline_ns && now_ns() >= st->trial_deadline_ns) {
+        st->trial_timed_out = 1;
+        return -EINTR;
+    }
+    if (ev->epoch != st->epoch)
         return 0;
 
     if (ev->kind == TRAWL_EVENT_TARGET_HIT && ev->speedup_ppm > 0) {
@@ -1687,15 +1708,28 @@ static int build_trial_plan(const struct options *opt, int ncandidates,
     return n;
 }
 
-static int poll_controller(struct ring_buffer *rb, pid_t child, int ms, int *child_exited)
+static int poll_controller(struct ring_buffer *rb, pid_t child, int ms,
+                           int *child_exited, struct run_state *st)
 {
     uint64_t deadline = now_ns() + (uint64_t)ms * 1000000ULL;
     while (now_ns() < deadline) {
         int timeout_ms = 50;
-        uint64_t left_ns = deadline - now_ns();
+        uint64_t now = now_ns();
+        if (st && st->trial_deadline_ns && now >= st->trial_deadline_ns) {
+            st->trial_timed_out = 1;
+            return -2;
+        }
+        uint64_t left_ns = deadline - now;
+        if (st && st->trial_deadline_ns && st->trial_deadline_ns > now) {
+            uint64_t hard_left_ns = st->trial_deadline_ns - now;
+            if (hard_left_ns < left_ns)
+                left_ns = hard_left_ns;
+        }
         if (left_ns < 50000000ULL)
             timeout_ms = (int)(left_ns / 1000000ULL) + 1;
-        ring_buffer__poll(rb, timeout_ms);
+        int err = ring_buffer__poll(rb, timeout_ms);
+        if (err < 0 && st && st->trial_timed_out)
+            return -2;
 
         int status = 0;
         pid_t r = waitpid(child, &status, WNOHANG);
@@ -1744,7 +1778,7 @@ static int run_discovery(struct trawl_bpf *skel, struct ring_buffer *rb,
     if (update_config(skel, &cfg) != 0)
         return -1;
 
-    if (poll_controller(rb, child, opt->discover_ms, child_exited) != 0)
+    if (poll_controller(rb, child, opt->discover_ms, child_exited, NULL) != 0)
         return -1;
 
     int n = collect_candidates_from_hist(child, bpf_map__fd(skel->maps.sample_hist),
@@ -1776,6 +1810,8 @@ static int run_trial(struct trawl_bpf *skel, struct ring_buffer *rb,
 
     state->current = res;
     state->epoch = epoch;
+    state->trial_timed_out = 0;
+    state->trial_deadline_ns = now_ns() + (uint64_t)opt->trial_timeout_ms * 1000000ULL;
     latency_tracker_reset(&state->latency, epoch);
     __atomic_store_n(&state->shm->controller_epoch, epoch, __ATOMIC_RELEASE);
     update_latency_control(state->shm, opt->latency_enabled,
@@ -1799,11 +1835,12 @@ static int run_trial(struct trawl_bpf *skel, struct ring_buffer *rb,
     if (update_config(skel, &cfg) != 0) {
         fprintf(stderr, "failed to update BPF config\n");
         state->current = NULL;
+        state->trial_deadline_ns = 0;
         return -1;
     }
 
     uint64_t t0 = now_ns();
-    poll_controller(rb, child, opt->duration_ms, child_exited);
+    int poll_rc = poll_controller(rb, child, opt->duration_ms, child_exited, state);
     uint64_t t1 = now_ns();
 
     cfg.active = 0;
@@ -1824,10 +1861,15 @@ static int run_trial(struct trawl_bpf *skel, struct ring_buffer *rb,
     res->rate_per_sec = res->effective_ns ?
         ((double)res->progress_count * 1e9 / (double)res->effective_ns) : 0.0;
     res->latency = state->latency.snap;
+    res->timed_out = state->trial_timed_out || poll_rc == -2;
 
     state->current = NULL;
-    wait_for_debt_drain(rb, state->shm, opt->cooldown_ms);
-    return *child_exited ? -1 : 0;
+    state->trial_deadline_ns = 0;
+    if (!res->timed_out)
+        wait_for_debt_drain(rb, state->shm, opt->cooldown_ms);
+    if (*child_exited)
+        return -1;
+    return res->timed_out ? -2 : 0;
 }
 
 static double tcrit95(int df)
@@ -1882,7 +1924,7 @@ static void write_candidate_table(FILE *out, const struct candidate *cands, int 
 static void write_trial_header(FILE *out)
 {
     fprintf(out,
-            "trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_sample_rate,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow\n");
+            "trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_sample_rate,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow,timed_out\n");
 }
 
 static void write_trial_row(FILE *out, const struct trial_result *r)
@@ -1894,7 +1936,7 @@ static void write_trial_row(FILE *out, const struct trial_result *r)
     double lat_p99_ms = (double)latency_percentile_ns(&r->latency, 0.99) / 1e6;
     double lat_max_ms = r->latency.count ? (double)r->latency.max_ns / 1e6 : 0.0;
 
-    fprintf(out, "%d,%d,%.3f,%lu,%lu,%lu,%lu,%.3f,%.3f,%lu,%.3f,%.6f,%u,%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%lu,%lu,%lu\n",
+    fprintf(out, "%d,%d,%.3f,%lu,%lu,%lu,%lu,%.3f,%.3f,%lu,%.3f,%.6f,%u,%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%lu,%lu,%lu,%d\n",
             r->trial_no,
             r->candidate_idx,
             pct,
@@ -1916,7 +1958,8 @@ static void write_trial_row(FILE *out, const struct trial_result *r)
             lat_max_ms,
             (unsigned long)r->latency.orphan_begin,
             (unsigned long)r->latency.orphan_end,
-            (unsigned long)r->latency.stack_overflow);
+            (unsigned long)r->latency.stack_overflow,
+            r->timed_out ? 1 : 0);
 }
 
 static void summarize_candidate_speedup(FILE *out,
@@ -1933,6 +1976,8 @@ static void summarize_candidate_speedup(FILE *out,
     latency_snapshot_init(&lat);
 
     for (int i = 0; i < nresults; i++) {
+        if (results[i].timed_out)
+            continue;
         if (results[i].candidate_idx != cand_idx)
             continue;
         if (results[i].speedup_ppm == 0)
@@ -2014,16 +2059,33 @@ static void json_escape(FILE *f, const char *s)
 
 static int write_json_report(const char *path, const struct candidate *cands, int ncands,
                              const struct options *opt,
-                             const struct trial_result *results, int nresults)
+                             const struct trial_result *results, int nresults,
+                             int planned_trials)
 {
     FILE *f = fopen(path, "w");
     if (!f)
         return -1;
+    int completed_trials = 0;
+    int timed_out_trials = 0;
+    for (int i = 0; i < nresults; i++) {
+        if (results[i].timed_out)
+            timed_out_trials++;
+        else
+            completed_trials++;
+    }
+
     fprintf(f, "{\n");
     fprintf(f, "  \"seed\": %lu,\n", (unsigned long)opt->seed);
     fprintf(f, "  \"repeats\": %d,\n", opt->repeats);
     fprintf(f, "  \"duration_ms\": %d,\n", opt->duration_ms);
+    fprintf(f, "  \"trial_timeout_ms\": %d,\n", opt->trial_timeout_ms);
     fprintf(f, "  \"sample_period_ns\": %lu,\n", (unsigned long)opt->sample_period_ns);
+    fprintf(f, "  \"planned_trials\": %d,\n", planned_trials);
+    fprintf(f, "  \"recorded_trials\": %d,\n", nresults);
+    fprintf(f, "  \"completed_trials\": %d,\n", completed_trials);
+    fprintf(f, "  \"timed_out_trials\": %d,\n", timed_out_trials);
+    fprintf(f, "  \"partial_report\": %s,\n",
+            (nresults < planned_trials || timed_out_trials) ? "true" : "false");
     const char *latency_sample_mode = !opt->latency_enabled ? "off" :
         (opt->latency_budget_per_sec ? "adaptive" :
          (opt->latency_sample_rate > 1 ? "fixed" : "all"));
@@ -2051,10 +2113,11 @@ static int write_json_report(const char *path, const struct candidate *cands, in
     fprintf(f, "  \"trials\": [\n");
     for (int i = 0; i < nresults; i++) {
         const struct trial_result *r = &results[i];
-        fprintf(f, "    {\"trial\": %d, \"candidate_idx\": %d, \"speedup_pct\": %.3f, \"epoch\": %lu, \"progress_count\": %lu, \"elapsed_ms\": %.3f, \"effective_ms\": %.3f, \"target_hits\": %lu, \"rate_per_sec\": %.9f, \"latency\": {\"sample_rate\": %u, \"count\": %lu, \"mean_ms\": %.9f, \"p50_ms\": %.9f, \"p90_ms\": %.9f, \"p99_ms\": %.9f, \"max_ms\": %.9f}}%s\n",
+        fprintf(f, "    {\"trial\": %d, \"candidate_idx\": %d, \"speedup_pct\": %.3f, \"epoch\": %lu, \"timed_out\": %s, \"progress_count\": %lu, \"elapsed_ms\": %.3f, \"effective_ms\": %.3f, \"target_hits\": %lu, \"rate_per_sec\": %.9f, \"latency\": {\"sample_rate\": %u, \"count\": %lu, \"mean_ms\": %.9f, \"p50_ms\": %.9f, \"p90_ms\": %.9f, \"p99_ms\": %.9f, \"max_ms\": %.9f}}%s\n",
                 r->trial_no, r->candidate_idx,
                 (double)r->speedup_ppm / 10000.0,
                 (unsigned long)r->epoch,
+                r->timed_out ? "true" : "false",
                 (unsigned long)r->progress_count,
                 (double)r->elapsed_ns / 1e6,
                 (double)r->effective_ns / 1e6,
@@ -2201,7 +2264,7 @@ int main(int argc, char **argv)
     update_latency_control(shm, 0, 0, opt.seed);
 
     if (opt.warmup_ms > 0)
-        poll_controller(rb, child, opt.warmup_ms, &child_exited);
+        poll_controller(rb, child, opt.warmup_ms, &child_exited, NULL);
     if (child_exited)
         goto out;
 
@@ -2282,14 +2345,25 @@ int main(int argc, char **argv)
         const struct trial_spec *ts = &plan[i];
         const struct candidate *cand = &candidates[ts->candidate_idx];
         uint64_t epoch = (uint64_t)i + 1;
-        if (run_trial(skel, rb, &opt, state, cand, ts->candidate_idx,
-                      &results[nresults], i + 1, epoch, ts->speedup_ppm,
-                      latency_sample_rate,
-                      child, &child_exited) != 0 && child_exited) {
+        int trial_rc = run_trial(skel, rb, &opt, state, cand, ts->candidate_idx,
+                                 &results[nresults], i + 1, epoch, ts->speedup_ppm,
+                                 latency_sample_rate,
+                                 child, &child_exited);
+        if (trial_rc != 0 && child_exited) {
+            break;
+        } else if (trial_rc < 0 && trial_rc != -2) {
+            fprintf(stderr, "trial %d failed; writing partial report\n", i + 1);
             break;
         }
         write_trial_row(trial_out, &results[nresults]);
         fflush(trial_out);
+        if (trial_rc == -2) {
+            fprintf(stderr,
+                    "trial %d exceeded watchdog timeout (%d ms); writing partial report with %d/%d trials\n",
+                    i + 1, opt.trial_timeout_ms, nresults + 1, nplan);
+            nresults++;
+            break;
+        }
         latency_sample_rate = adapt_latency_sample_rate(&opt, &results[nresults]);
         nresults++;
     }
@@ -2302,7 +2376,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     if (opt.json_path) {
-        if (write_json_report(opt.json_path, candidates, ncandidates, &opt, results, nresults) != 0)
+        if (write_json_report(opt.json_path, candidates, ncandidates, &opt, results, nresults, nplan) != 0)
             fprintf(stderr, "warning: failed to write JSON report %s: %s\n", opt.json_path, strerror(errno));
     }
 

@@ -11,7 +11,7 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct trawl_config);
-} config SEC(".maps");
+} trawl_config_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -42,7 +42,7 @@ struct {
 static __always_inline struct trawl_config *get_config(void)
 {
     __u32 zero = 0;
-    return bpf_map_lookup_elem(&config, &zero);
+    return bpf_map_lookup_elem(&trawl_config_map, &zero);
 }
 
 static __always_inline int is_target_tgid(const struct trawl_config *cfg, __u32 tgid)

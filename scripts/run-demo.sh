@@ -8,6 +8,7 @@ SYMBOL="${SYMBOL:-target_work}"
 TARGET_BINARY="${TARGET_BINARY:-./examples/demo_server}"
 TARGET_COMMAND="${TARGET_COMMAND:-$TARGET_BINARY}"
 DURATION_MS="${DURATION_MS:-5000}"
+TRIAL_TIMEOUT_MS="${TRIAL_TIMEOUT_MS:-}"
 WARMUP_MS="${WARMUP_MS:-1000}"
 COOLDOWN_MS="${COOLDOWN_MS:-200}"
 REPEATS="${REPEATS:-10}"
@@ -34,6 +35,10 @@ docker run --rm --privileged --pid=host \
     if [[ -n "${12}" ]]; then
       seed_args=(--seed "${12}")
     fi
+    timeout_args=()
+    if [[ -n "${17}" ]]; then
+      timeout_args=(--trial-timeout-ms "${17}")
+    fi
     latency_args=()
     case "${14}" in
       0|false|False|FALSE|no|No|NO|off|Off|OFF) ;;
@@ -53,6 +58,7 @@ docker run --rm --privileged --pid=host \
       --progress-id 1 \
       "${latency_args[@]}" \
       --duration-ms "$3" \
+      "${timeout_args[@]}" \
       --warmup-ms "$4" \
       --cooldown-ms "$5" \
       --repeats "$6" \
@@ -79,4 +85,5 @@ docker run --rm --privileged --pid=host \
     "$TARGET_COMMAND" \
     "$LATENCY" \
     "$LATENCY_SAMPLE" \
-    "$LATENCY_BUDGET"
+    "$LATENCY_BUDGET" \
+    "$TRIAL_TIMEOUT_MS"

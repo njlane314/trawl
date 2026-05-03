@@ -11,6 +11,7 @@ The current version includes the production upgrades that were missing from the 
 - DWARF/source attribution through `addr2line` after robust `/proc/<pid>/maps` load-bias translation;
 - stronger ELF/PIE/shared-object symbol resolution;
 - machine-readable JSON, trial CSV, and candidate CSV outputs;
+- per-trial watchdog timeouts with partial report output for stalled runs;
 - a cooperative pause backend plus an invasive `ptrace` backend for uninstrumented CPU-bound code;
 - thread registration through a `pthread_create` wrapper and more blocking-boundary polling wrappers.
 
@@ -113,9 +114,12 @@ SEED=42 ./scripts/run-demo.sh
 LATENCY=0 DURATION_MS=10000 REPEATS=20 SAMPLE_NS=1000000 ./scripts/run-demo.sh
 LATENCY=1 LATENCY_BUDGET=5000 DURATION_MS=10000 REPEATS=20 ./scripts/run-demo.sh
 LATENCY=1 LATENCY_SAMPLE=100 DURATION_MS=10000 REPEATS=20 ./scripts/run-demo.sh
+TRIAL_TIMEOUT_MS=45000 DURATION_MS=10000 REPEATS=20 ./scripts/run-demo.sh
 ```
 
 Use `LATENCY=0` for long throughput-only runs. The default `LATENCY=1` now uses `LATENCY_BUDGET=5000`, so the shim samples latency spans before they hit uprobes and keeps latency traffic bounded on very fast workloads. Set `LATENCY_SAMPLE=N` to record a fixed 1-in-N span sample, or set `LATENCY_BUDGET=0` to record every latency span.
+
+Each trial has a hard watchdog timeout. By default it is derived from `DURATION_MS`, with at least 30 seconds of extra margin. Override it with `TRIAL_TIMEOUT_MS=N` in the wrapper scripts or `--trial-timeout-ms N` when running `build/trawl` directly. If a trial times out, Trawl writes the partial trial row, excludes that timed-out row from the summary statistics, and still writes the CSV/JSON reports for the data collected so far.
 
 Compare against a workload where sleeping dominates the request:
 
@@ -183,6 +187,7 @@ sudo ./build/trawl \
   --latency \
   --latency-budget 5000 \
   --duration-ms 3000 \
+  --trial-timeout-ms 15000 \
   --warmup-ms 1000 \
   --repeats 5 \
   --speedups 0,5,10,25,50 \
@@ -239,7 +244,7 @@ The `ptrace` backend seizes target threads, interrupts all non-sampled threads o
 Trial rows:
 
 ```text
-trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_sample_rate,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow
+trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_sample_rate,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow,timed_out
 ```
 
 Summary rows:
@@ -253,6 +258,8 @@ summary_type,candidate_idx,name,speedup_pct,n,rate_mean,rate_ci95_low,rate_ci95_
 ## How to read results
 
 Start with `progress_count`. If it is zero, the workload did not report completed units of work and the experiment is not meaningful.
+
+Check `timed_out` before interpreting a row. Timed-out rows are kept in the trial CSV/JSON for debugging, but they are excluded from summary statistics because they may represent a partial trial. In JSON, `partial_report: true` means the planned trial grid did not finish normally.
 
 Check `target_hits` for non-zero speedup trials. If it is zero, the sampler did not observe execution inside the selected target, so the virtual speedup was not actually exercised.
 
