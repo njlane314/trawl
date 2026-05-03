@@ -26,6 +26,9 @@ static int g_fd = -1;
 static __thread int g_slot = -1;
 static __thread uint64_t g_local_debt_ns;
 static __thread int g_inside_poll;
+static __thread uint8_t g_latency_sample_stack[64];
+static __thread uint16_t g_latency_sample_depth;
+static __thread uint64_t g_latency_sequence;
 
 static uint64_t monotonic_ns(void)
 {
@@ -49,6 +52,16 @@ static void sleep_ns_raw(uint64_t ns)
     while (syscall(SYS_nanosleep, &req, &req) < 0 && errno == EINTR) {
         ;
     }
+}
+
+static uint64_t trawl_mix64(uint64_t x)
+{
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
 }
 
 static void trawl_init_shm(void)
@@ -189,6 +202,84 @@ void trawl_latency_end_id(uint32_t id, uint64_t token)
     trawl_poll();
     (void)id;
     (void)token;
+}
+
+static int trawl_latency_should_sample(uint32_t id, uint64_t token)
+{
+    trawl_init_shm();
+    if (!g_shm)
+        return 0;
+
+    uint32_t enabled = __atomic_load_n(&g_shm->latency_enabled, __ATOMIC_ACQUIRE);
+    if (!enabled)
+        return 0;
+
+    uint32_t sample_rate = __atomic_load_n(&g_shm->latency_sample_rate, __ATOMIC_ACQUIRE);
+    if (sample_rate == 0)
+        return 0;
+    if (sample_rate == 1)
+        return 1;
+
+    uint64_t seed = __atomic_load_n(&g_shm->latency_sample_seed, __ATOMIC_ACQUIRE);
+    uint64_t h = trawl_mix64(seed ^ ((uint64_t)id << 32) ^ token);
+    return h % sample_rate == 0;
+}
+
+static void trawl_latency_push_sample(uint8_t sampled)
+{
+    if (g_latency_sample_depth < sizeof(g_latency_sample_stack))
+        g_latency_sample_stack[g_latency_sample_depth] = sampled;
+    if (g_latency_sample_depth < UINT16_MAX)
+        g_latency_sample_depth++;
+}
+
+static uint8_t trawl_latency_pop_sample(void)
+{
+    if (g_latency_sample_depth == 0)
+        return 0;
+    g_latency_sample_depth--;
+    if (g_latency_sample_depth >= sizeof(g_latency_sample_stack))
+        return 0;
+    return g_latency_sample_stack[g_latency_sample_depth];
+}
+
+__attribute__((visibility("default")))
+void trawl_latency_begin_sampled(uint32_t id)
+{
+    uint64_t token = ++g_latency_sequence;
+    uint8_t sampled = (uint8_t)trawl_latency_should_sample(id, token);
+    trawl_latency_push_sample(sampled);
+    if (sampled)
+        trawl_latency_begin(id);
+    else
+        trawl_poll();
+}
+
+__attribute__((visibility("default")))
+void trawl_latency_end_sampled(uint32_t id)
+{
+    if (trawl_latency_pop_sample())
+        trawl_latency_end(id);
+    else
+        trawl_poll();
+}
+
+__attribute__((visibility("default")))
+void trawl_latency_begin_id_sampled(uint32_t id, uint64_t token)
+{
+    if (trawl_latency_should_sample(id, token))
+        trawl_latency_begin_id(id, token);
+    else
+        trawl_poll();
+}
+
+__attribute__((visibility("default")))
+void trawl_latency_end_id_sampled(uint32_t id, uint64_t token)
+{
+    if (trawl_latency_should_sample(id, token))
+        trawl_latency_end_id(id, token);
+    else
+        trawl_poll();
 }
 
 struct trawl_start_thunk {

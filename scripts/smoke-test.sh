@@ -23,6 +23,7 @@ awk -F, '
     NR == 1 { next }
     $5 + 0 > 0 { progress_seen = 1 }
     $3 + 0 > 0 && $10 + 0 > 0 { target_hits_seen = 1 }
+    $14 + 0 > 0 { latency_seen = 1 }
     END {
         if (!progress_seen) {
             print "smoke test failed: no positive progress_count in trials" > "/dev/stderr";
@@ -30,6 +31,10 @@ awk -F, '
         }
         if (!target_hits_seen) {
             print "smoke test failed: no target_hits for a non-zero speedup trial" > "/dev/stderr";
+            exit 1;
+        }
+        if (!latency_seen) {
+            print "smoke test failed: no sampled latency spans in trials" > "/dev/stderr";
             exit 1;
         }
     }
@@ -41,4 +46,4 @@ if [[ "$summary_count" -lt 2 ]]; then
   exit 1
 fi
 
-echo "smoke test passed: progress, target hits, and summary rows were observed"
+echo "smoke test passed: progress, target hits, sampled latency, and summary rows were observed"

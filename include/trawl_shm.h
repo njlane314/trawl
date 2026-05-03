@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#define TRAWL_SHM_MAGIC   0x545241574c534832ULL /* "TRAWLSH2" */
-#define TRAWL_SHM_VERSION 2
+#define TRAWL_SHM_MAGIC   0x545241574c534833ULL /* "TRAWLSH3" */
+#define TRAWL_SHM_VERSION 3
 #define TRAWL_MAX_THREADS 4096
 
 /* Cache-line-sized slot. The controller writes debt_ns; target threads read it. */
@@ -27,6 +27,9 @@ struct trawl_shm {
     volatile uint64_t controller_epoch;
     volatile uint64_t total_virtual_delay_ns;
     volatile uint64_t dropped_debt_events;
+    volatile uint32_t latency_enabled;
+    volatile uint32_t latency_sample_rate;
+    volatile uint64_t latency_sample_seed;
     struct trawl_thread_slot slots[TRAWL_MAX_THREADS];
 };
 

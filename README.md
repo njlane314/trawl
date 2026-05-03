@@ -6,7 +6,7 @@ The current version includes the production upgrades that were missing from the 
 
 - randomised repeated trials per candidate/speedup;
 - 95% confidence intervals for rate and impact estimates;
-- latency begin/end tracking with token-correlated request ids and p50/p90/p99 reporting;
+- sampled latency begin/end tracking with token-correlated request ids and p50/p90/p99 reporting;
 - auto-discovery of hot function candidates from the BPF sample histogram;
 - DWARF/source attribution through `addr2line` after robust `/proc/<pid>/maps` load-bias translation;
 - stronger ELF/PIE/shared-object symbol resolution;
@@ -111,9 +111,11 @@ DURATION_MS=10000 REPEATS=20 SPEEDUPS=0,5,10,25,50 ./scripts/run-demo.sh
 TOP_CANDIDATES=10 DISCOVER_MS=5000 REPEATS=10 ./scripts/run-auto.sh
 SEED=42 ./scripts/run-demo.sh
 LATENCY=0 DURATION_MS=10000 REPEATS=20 SAMPLE_NS=1000000 ./scripts/run-demo.sh
+LATENCY=1 LATENCY_BUDGET=5000 DURATION_MS=10000 REPEATS=20 ./scripts/run-demo.sh
+LATENCY=1 LATENCY_SAMPLE=100 DURATION_MS=10000 REPEATS=20 ./scripts/run-demo.sh
 ```
 
-Use `LATENCY=0` for long throughput-only runs. The default `LATENCY=1` records begin/end marker events and reports latency quantiles, which is useful but can create high event volume on very fast workloads.
+Use `LATENCY=0` for long throughput-only runs. The default `LATENCY=1` now uses `LATENCY_BUDGET=5000`, so the shim samples latency spans before they hit uprobes and keeps latency traffic bounded on very fast workloads. Set `LATENCY_SAMPLE=N` to record a fixed 1-in-N span sample, or set `LATENCY_BUDGET=0` to record every latency span.
 
 Compare against a workload where sleeping dominates the request:
 
@@ -158,7 +160,17 @@ TRAWL_LATENCY_END_ID(1, token);
 TRAWL_PROGRESS(1);
 ```
 
-The controller matches begin/end events by `(epoch, progress_id, token)` when a token is supplied; otherwise it falls back to `(epoch, progress_id, tid)`. It reports latency count, mean, p50, p90, p99, max, orphan begin/end counts, and nesting overflow counts.
+The marker macros sample latency spans in the `LD_PRELOAD` shim before calling the noinline uprobe target functions. Unsampled spans still call `trawl_poll()` but do not emit begin/end uprobes. Token-correlated markers use a deterministic hash of `(progress_id, token, seed)`, so begin and end make the same sampling decision. Simple non-token markers keep a thread-local sampling stack.
+
+The controller matches sampled begin/end events by `(epoch, progress_id, token)` when a token is supplied; otherwise it falls back to `(epoch, progress_id, tid)`. It reports latency count, mean, p50, p90, p99, max, orphan begin/end counts, nesting overflow counts, and the sample rate used for each trial.
+
+Latency sampling options:
+
+```sh
+--latency                 # exact latency mode; records every span unless paired with sampling
+--latency-sample 100      # fixed 1-in-100 span sample
+--latency-budget 5000     # adaptive sampling towards 5000 sampled spans/sec
+```
 
 ## Manual function-level causal profiling
 
@@ -169,6 +181,7 @@ sudo ./build/trawl \
   --symbol target_work \
   --progress-id 1 \
   --latency \
+  --latency-budget 5000 \
   --duration-ms 3000 \
   --warmup-ms 1000 \
   --repeats 5 \
@@ -193,6 +206,7 @@ sudo ./build/trawl \
   --discover-ms 5000 \
   --progress-id 1 \
   --latency \
+  --latency-budget 5000 \
   --repeats 3 \
   --speedups 0,10,25,50 \
   --candidates-csv candidates.csv \
@@ -225,13 +239,13 @@ The `ptrace` backend seizes target threads, interrupts all non-sampled threads o
 Trial rows:
 
 ```text
-trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow
+trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_sample_rate,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow
 ```
 
 Summary rows:
 
 ```text
-summary_type,candidate_idx,name,speedup_pct,n,rate_mean,rate_ci95_low,rate_ci95_high,impact_pct,impact_ci95_low,impact_ci95_high,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms
+summary_type,candidate_idx,name,speedup_pct,n,rate_mean,rate_ci95_low,rate_ci95_high,impact_pct,impact_ci95_low,impact_ci95_high,lat_sample_rate_mean,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms
 ```
 
 `impact_pct` estimates the application-level throughput effect of virtually speeding up that candidate by the given percentage. The confidence interval is computed on the log rate ratio using the repeated randomised trials.
@@ -246,7 +260,7 @@ Use `rate_mean` and `impact_pct` together. `rate_mean` is measured throughput; `
 
 Use `rate_ci95_low`, `rate_ci95_high`, `impact_ci95_low`, and `impact_ci95_high` to judge uncertainty. Wide intervals usually mean the run was too short, had too few repeats, or used an unstable workload.
 
-Use `lat_p50_ms`, `lat_p90_ms`, and `lat_p99_ms` to check whether a throughput gain came with better or worse request latency.
+Use `lat_sample_rate` to see the span sampling denominator for a trial. `lat_sample_rate=1` means every span was recorded; `lat_sample_rate=100` means roughly 1 in 100 spans was recorded. Use `lat_p50_ms`, `lat_p90_ms`, and `lat_p99_ms` to check whether a throughput gain came with better or worse request latency.
 
 Use `virtual_delay_ms` as a sanity check. It should be positive for non-zero speedup trials with target hits. Very large delay values indicate that the experiment heavily perturbed scheduling.
 
@@ -263,7 +277,7 @@ Causal profiles are only as good as the progress metric and the workload. Use re
 ## Known limitations
 
 - The BPF sampler uses instruction-pointer intervals; line-level speedups require manually supplied runtime ranges.
-- Latency quantiles are histogram-based approximations, not exact order statistics.
+- Latency quantiles are sampled, histogram-based approximations, not exact order statistics.
 - `addr2line` attribution depends on debug information being available.
 - The `ptrace` backend is intentionally invasive and can substantially distort very fine-grained workloads.
 - Auto-discovery groups samples by ELF function symbols; heavily inlined code may be attributed to the containing concrete symbol rather than the logical inline frame.

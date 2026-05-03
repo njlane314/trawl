@@ -16,6 +16,8 @@ SAMPLE_NS="${SAMPLE_NS:-100000}"
 REPORT_DIR="${REPORT_DIR:-reports}"
 REPORT_NAME="${REPORT_NAME:-demo}"
 LATENCY="${LATENCY:-1}"
+LATENCY_SAMPLE="${LATENCY_SAMPLE:-}"
+LATENCY_BUDGET="${LATENCY_BUDGET:-5000}"
 SEED="${SEED:-}"
 
 "$ROOT_DIR/scripts/docker-build.sh"
@@ -35,7 +37,14 @@ docker run --rm --privileged --pid=host \
     latency_args=()
     case "${14}" in
       0|false|False|FALSE|no|No|NO|off|Off|OFF) ;;
-      *) latency_args=(--latency) ;;
+      *)
+        latency_args=(--latency)
+        if [[ -n "${15}" && "${15}" != "0" ]]; then
+          latency_args=(--latency-sample "${15}")
+        elif [[ -n "${16}" && "${16}" != "0" ]]; then
+          latency_args=(--latency-budget "${16}")
+        fi
+        ;;
     esac
     exec ./build/trawl \
       --shim ./build/libtrawl_shim.so \
@@ -68,4 +77,6 @@ docker run --rm --privileged --pid=host \
     "$REPORT_DIR/$REPORT_NAME-candidates.csv" \
     "$SEED" \
     "$TARGET_COMMAND" \
-    "$LATENCY"
+    "$LATENCY" \
+    "$LATENCY_SAMPLE" \
+    "$LATENCY_BUDGET"

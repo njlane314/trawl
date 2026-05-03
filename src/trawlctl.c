@@ -69,6 +69,9 @@ struct options {
     int auto_candidates;
     int top_candidates;
     int latency_enabled;
+    int latency_sample_set;
+    uint32_t latency_sample_rate;
+    uint32_t latency_budget_per_sec;
     int emit_progress_events;
     int randomize;
     uint64_t seed;
@@ -164,6 +167,7 @@ struct trial_result {
     uint64_t effective_ns;
     uint64_t virtual_delay_ns;
     uint64_t target_hits;
+    uint32_t latency_sample_rate;
     double rate_per_sec;
     struct latency_snapshot latency;
 };
@@ -237,7 +241,9 @@ static void usage(const char *argv0)
         "  --auto                  discover hot function candidates from sample_hist\n"
         "  --top-candidates N      number of auto-discovered candidates; default: 1\n"
         "  --progress-id ID        progress marker id; default: 1\n"
-        "  --latency               consume BEGIN/END marker events and report latency quantiles\n\n"
+        "  --latency               consume BEGIN/END marker events and report latency quantiles\n"
+        "  --latency-sample N      record 1 in N latency spans; implies --latency\n"
+        "  --latency-budget N      adapt latency sampling towards N spans/sec; implies --latency\n\n"
         "experiment design:\n"
         "  --duration-ms N         duration per trial; default: 5000\n"
         "  --warmup-ms N           warmup before discovery/trials; default: 1000\n"
@@ -360,6 +366,17 @@ static int parse_pause_backend(const char *s, enum pause_backend_kind *out)
     return -1;
 }
 
+static int parse_u32_str(const char *s, uint32_t *out)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 0);
+    if (errno || !end || *end || v > UINT32_MAX)
+        return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
 static int parse_args(int argc, char **argv, struct options *opt)
 {
     memset(opt, 0, sizeof(*opt));
@@ -371,6 +388,7 @@ static int parse_args(int argc, char **argv, struct options *opt)
     opt->sample_period_ns = 1000000ULL;
     opt->progress_id = 1;
     opt->top_candidates = 1;
+    opt->latency_sample_rate = 1;
     opt->randomize = 1;
     opt->seed = now_ns() ^ (uint64_t)getpid();
     opt->pause_backend = PAUSE_COOP;
@@ -419,6 +437,15 @@ static int parse_args(int argc, char **argv, struct options *opt)
             opt->auto_candidates = 1;
         } else if (strcmp(argv[i], "--latency") == 0) {
             opt->latency_enabled = 1;
+        } else if (strcmp(argv[i], "--latency-sample") == 0 && i + 1 < argc) {
+            if (parse_u32_str(argv[++i], &opt->latency_sample_rate) != 0)
+                return -1;
+            opt->latency_sample_set = 1;
+            opt->latency_enabled = 1;
+        } else if (strcmp(argv[i], "--latency-budget") == 0 && i + 1 < argc) {
+            if (parse_u32_str(argv[++i], &opt->latency_budget_per_sec) != 0)
+                return -1;
+            opt->latency_enabled = 1;
         } else if (strcmp(argv[i], "--emit-progress-events") == 0) {
             opt->emit_progress_events = 1;
         } else if (strcmp(argv[i], "--no-randomize") == 0) {
@@ -447,6 +474,12 @@ static int parse_args(int argc, char **argv, struct options *opt)
         return -1;
     if (opt->duration_ms <= 0 || opt->sample_period_ns == 0 || opt->repeats <= 0)
         return -1;
+    if (opt->latency_sample_rate == 0)
+        return -1;
+    if (opt->latency_sample_set && opt->latency_budget_per_sec)
+        return -1;
+    if (!opt->latency_enabled)
+        opt->latency_sample_rate = 0;
     if (opt->warmup_ms < 0 || opt->cooldown_ms < 0 || opt->discover_ms < 0)
         return -1;
     if (opt->top_candidates <= 0 || opt->top_candidates > TRAWL_MAX_CANDIDATES)
@@ -1031,6 +1064,45 @@ static int update_config(struct trawl_bpf *skel, const struct trawl_config *cfg)
     uint32_t zero = 0;
     int fd = bpf_map__fd(skel->maps.config);
     return bpf_map_update_elem(fd, &zero, cfg, BPF_ANY);
+}
+
+static void update_latency_control(struct trawl_shm *shm, int enabled,
+                                   uint32_t sample_rate, uint64_t seed)
+{
+    if (!enabled)
+        sample_rate = 0;
+    if (enabled && sample_rate == 0)
+        sample_rate = 1;
+    __atomic_store_n(&shm->latency_sample_seed, seed, __ATOMIC_RELEASE);
+    __atomic_store_n(&shm->latency_sample_rate, sample_rate, __ATOMIC_RELEASE);
+    __atomic_store_n(&shm->latency_enabled, enabled ? 1u : 0u, __ATOMIC_RELEASE);
+}
+
+static uint32_t initial_latency_sample_rate(const struct options *opt)
+{
+    if (!opt->latency_enabled)
+        return 0;
+    if (opt->latency_budget_per_sec)
+        return 16;
+    return opt->latency_sample_rate ? opt->latency_sample_rate : 1;
+}
+
+static uint32_t adapt_latency_sample_rate(const struct options *opt,
+                                          const struct trial_result *r)
+{
+    if (!opt->latency_budget_per_sec)
+        return r->latency_sample_rate;
+    if (!r->elapsed_ns || !r->progress_count)
+        return r->latency_sample_rate ? r->latency_sample_rate : 1;
+
+    double progress_per_sec = (double)r->progress_count * 1e9 / (double)r->elapsed_ns;
+    double target = (double)opt->latency_budget_per_sec;
+    double rate = ceil(progress_per_sec / target);
+    if (rate < 1.0)
+        rate = 1.0;
+    if (rate > (double)UINT32_MAX)
+        rate = (double)UINT32_MAX;
+    return (uint32_t)rate;
 }
 
 static uint64_t read_progress_count(int map_fd, uint64_t epoch, uint32_t id, uint32_t kind)
@@ -1690,6 +1762,7 @@ static int run_trial(struct trawl_bpf *skel, struct ring_buffer *rb,
                      const struct candidate *cand, int cand_idx,
                      struct trial_result *res, int trial_no,
                      uint64_t epoch, uint32_t speedup_ppm,
+                     uint32_t latency_sample_rate,
                      pid_t child, int *child_exited)
 {
     memset(res, 0, sizeof(*res));
@@ -1698,12 +1771,15 @@ static int run_trial(struct trawl_bpf *skel, struct ring_buffer *rb,
     res->speedup_ppm = speedup_ppm;
     res->epoch = epoch;
     res->effective_ns = 0;
+    res->latency_sample_rate = opt->latency_enabled ? latency_sample_rate : 0;
     latency_snapshot_init(&res->latency);
 
     state->current = res;
     state->epoch = epoch;
     latency_tracker_reset(&state->latency, epoch);
     __atomic_store_n(&state->shm->controller_epoch, epoch, __ATOMIC_RELEASE);
+    update_latency_control(state->shm, opt->latency_enabled,
+                           res->latency_sample_rate, opt->seed);
 
     struct trawl_config cfg = {
         .target_tgid = (uint32_t)child,
@@ -1732,6 +1808,7 @@ static int run_trial(struct trawl_bpf *skel, struct ring_buffer *rb,
 
     cfg.active = 0;
     update_config(skel, &cfg);
+    update_latency_control(state->shm, 0, 0, opt->seed);
     ring_buffer__poll(rb, 100);
 
     res->elapsed_ns = t1 - t0;
@@ -1805,7 +1882,7 @@ static void write_candidate_table(FILE *out, const struct candidate *cands, int 
 static void write_trial_header(FILE *out)
 {
     fprintf(out,
-            "trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow\n");
+            "trial,candidate_idx,speedup_pct,epoch,progress_count,begin_count,end_count,elapsed_ms,effective_ms,target_hits,virtual_delay_ms,rate_per_sec,lat_sample_rate,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_max_ms,lat_orphan_begin,lat_orphan_end,lat_stack_overflow\n");
 }
 
 static void write_trial_row(FILE *out, const struct trial_result *r)
@@ -1817,7 +1894,7 @@ static void write_trial_row(FILE *out, const struct trial_result *r)
     double lat_p99_ms = (double)latency_percentile_ns(&r->latency, 0.99) / 1e6;
     double lat_max_ms = r->latency.count ? (double)r->latency.max_ns / 1e6 : 0.0;
 
-    fprintf(out, "%d,%d,%.3f,%lu,%lu,%lu,%lu,%.3f,%.3f,%lu,%.3f,%.6f,%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%lu,%lu,%lu\n",
+    fprintf(out, "%d,%d,%.3f,%lu,%lu,%lu,%lu,%.3f,%.3f,%lu,%.3f,%.6f,%u,%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%lu,%lu,%lu\n",
             r->trial_no,
             r->candidate_idx,
             pct,
@@ -1830,6 +1907,7 @@ static void write_trial_row(FILE *out, const struct trial_result *r)
             (unsigned long)r->target_hits,
             (double)r->virtual_delay_ns / 1e6,
             r->rate_per_sec,
+            r->latency_sample_rate,
             (unsigned long)r->latency.count,
             lat_mean_ms,
             lat_p50_ms,
@@ -1850,6 +1928,7 @@ static void summarize_candidate_speedup(FILE *out,
 {
     struct scalar_stats rate = {0};
     struct scalar_stats base = {0};
+    struct scalar_stats lat_sample = {0};
     struct latency_snapshot lat;
     latency_snapshot_init(&lat);
 
@@ -1860,6 +1939,8 @@ static void summarize_candidate_speedup(FILE *out,
             scalar_add(&base, results[i].rate_per_sec);
         if (results[i].speedup_ppm == ppm) {
             scalar_add(&rate, results[i].rate_per_sec);
+            if (results[i].latency_sample_rate)
+                scalar_add(&lat_sample, (double)results[i].latency_sample_rate);
             latency_snapshot_merge(&lat, &results[i].latency);
         }
     }
@@ -1887,10 +1968,11 @@ static void summarize_candidate_speedup(FILE *out,
 
     double pct = (double)ppm / 10000.0;
     fprintf(out,
-            "summary,%d,\"%s\",%.3f,%d,%.6f,%.6f,%.6f,%.3f,%.3f,%.3f,%lu,%.6f,%.6f,%.6f,%.6f\n",
+            "summary,%d,\"%s\",%.3f,%d,%.6f,%.6f,%.6f,%.3f,%.3f,%.3f,%.3f,%lu,%.6f,%.6f,%.6f,%.6f\n",
             cand_idx, cands[cand_idx].name, pct, rate.n,
             rate.mean, rate_lo, rate_hi,
             impact, impact_lo, impact_hi,
+            lat_sample.n ? lat_sample.mean : 0.0,
             (unsigned long)lat.count,
             lat.count ? lat.mean_ns / 1e6 : 0.0,
             (double)latency_percentile_ns(&lat, 0.50) / 1e6,
@@ -1902,7 +1984,7 @@ static void write_summary(FILE *out, const struct candidate *cands, int ncands,
                           const struct options *opt,
                           const struct trial_result *results, int nresults)
 {
-    fprintf(out, "summary_type,candidate_idx,name,speedup_pct,n,rate_mean,rate_ci95_low,rate_ci95_high,impact_pct,impact_ci95_low,impact_ci95_high,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms\n");
+    fprintf(out, "summary_type,candidate_idx,name,speedup_pct,n,rate_mean,rate_ci95_low,rate_ci95_high,impact_pct,impact_ci95_low,impact_ci95_high,lat_sample_rate_mean,lat_count,lat_mean_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms\n");
     for (int c = 0; c < ncands; c++) {
         for (int s = 0; s < opt->speedup_count; s++)
             summarize_candidate_speedup(out, cands, c, opt->speedups_ppm[s], results, nresults);
@@ -1942,6 +2024,13 @@ static int write_json_report(const char *path, const struct candidate *cands, in
     fprintf(f, "  \"repeats\": %d,\n", opt->repeats);
     fprintf(f, "  \"duration_ms\": %d,\n", opt->duration_ms);
     fprintf(f, "  \"sample_period_ns\": %lu,\n", (unsigned long)opt->sample_period_ns);
+    const char *latency_sample_mode = !opt->latency_enabled ? "off" :
+        (opt->latency_budget_per_sec ? "adaptive" :
+         (opt->latency_sample_rate > 1 ? "fixed" : "all"));
+    fprintf(f, "  \"latency_enabled\": %s,\n", opt->latency_enabled ? "true" : "false");
+    fprintf(f, "  \"latency_sample_mode\": \"%s\",\n", latency_sample_mode);
+    fprintf(f, "  \"latency_initial_sample_rate\": %u,\n", initial_latency_sample_rate(opt));
+    fprintf(f, "  \"latency_budget_per_sec\": %u,\n", opt->latency_budget_per_sec);
 
     fprintf(f, "  \"candidates\": [\n");
     for (int i = 0; i < ncands; i++) {
@@ -1962,7 +2051,7 @@ static int write_json_report(const char *path, const struct candidate *cands, in
     fprintf(f, "  \"trials\": [\n");
     for (int i = 0; i < nresults; i++) {
         const struct trial_result *r = &results[i];
-        fprintf(f, "    {\"trial\": %d, \"candidate_idx\": %d, \"speedup_pct\": %.3f, \"epoch\": %lu, \"progress_count\": %lu, \"elapsed_ms\": %.3f, \"effective_ms\": %.3f, \"target_hits\": %lu, \"rate_per_sec\": %.9f, \"latency\": {\"count\": %lu, \"mean_ms\": %.9f, \"p50_ms\": %.9f, \"p90_ms\": %.9f, \"p99_ms\": %.9f, \"max_ms\": %.9f}}%s\n",
+        fprintf(f, "    {\"trial\": %d, \"candidate_idx\": %d, \"speedup_pct\": %.3f, \"epoch\": %lu, \"progress_count\": %lu, \"elapsed_ms\": %.3f, \"effective_ms\": %.3f, \"target_hits\": %lu, \"rate_per_sec\": %.9f, \"latency\": {\"sample_rate\": %u, \"count\": %lu, \"mean_ms\": %.9f, \"p50_ms\": %.9f, \"p90_ms\": %.9f, \"p99_ms\": %.9f, \"max_ms\": %.9f}}%s\n",
                 r->trial_no, r->candidate_idx,
                 (double)r->speedup_ppm / 10000.0,
                 (unsigned long)r->epoch,
@@ -1971,6 +2060,7 @@ static int write_json_report(const char *path, const struct candidate *cands, in
                 (double)r->effective_ns / 1e6,
                 (unsigned long)r->target_hits,
                 r->rate_per_sec,
+                r->latency_sample_rate,
                 (unsigned long)r->latency.count,
                 r->latency.count ? r->latency.mean_ns / 1e6 : 0.0,
                 (double)latency_percentile_ns(&r->latency, 0.50) / 1e6,
@@ -2108,6 +2198,7 @@ int main(int argc, char **argv)
         .latency_enabled = 0,
     };
     update_config(skel, &idle_cfg);
+    update_latency_control(shm, 0, 0, opt.seed);
 
     if (opt.warmup_ms > 0)
         poll_controller(rb, child, opt.warmup_ms, &child_exited);
@@ -2171,10 +2262,19 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "running %d trials; seed=%lu pause_backend=%s latency=%s\n",
+    uint32_t latency_sample_rate = initial_latency_sample_rate(&opt);
+    fprintf(stderr, "running %d trials; seed=%lu pause_backend=%s latency=%s",
             nplan, (unsigned long)opt.seed,
             opt.pause_backend == PAUSE_PTRACE ? "ptrace" : "coop",
             opt.latency_enabled ? "on" : "off");
+    if (opt.latency_enabled) {
+        if (opt.latency_budget_per_sec)
+            fprintf(stderr, " sample=adaptive budget=%u/s initial=1/%u",
+                    opt.latency_budget_per_sec, latency_sample_rate);
+        else
+            fprintf(stderr, " sample=1/%u", latency_sample_rate);
+    }
+    fprintf(stderr, "\n");
 
     write_trial_header(trial_out);
     int nresults = 0;
@@ -2184,11 +2284,13 @@ int main(int argc, char **argv)
         uint64_t epoch = (uint64_t)i + 1;
         if (run_trial(skel, rb, &opt, state, cand, ts->candidate_idx,
                       &results[nresults], i + 1, epoch, ts->speedup_ppm,
+                      latency_sample_rate,
                       child, &child_exited) != 0 && child_exited) {
             break;
         }
         write_trial_row(trial_out, &results[nresults]);
         fflush(trial_out);
+        latency_sample_rate = adapt_latency_sample_rate(&opt, &results[nresults]);
         nresults++;
     }
 
