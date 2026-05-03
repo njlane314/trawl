@@ -1,0 +1,12 @@
+build/
+examples/demo_server
+
+*.o
+*.so
+*.dSYM/
+
+*.csv
+*.json
+*.log
+
+.DS_Store
