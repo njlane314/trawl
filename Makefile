@@ -10,7 +10,7 @@ BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -I$(BUILD) -Ibpf
 USER_CFLAGS := -g -O2 -Wall -Wextra -I$(BUILD) -Ibpf -Iinclude
 USER_LDLIBS := -lbpf -lelf -lz -pthread -ldl -lm
 
-.PHONY: all clean examples
+.PHONY: all clean examples docker-build docker-demo docker-auto docker-smoke
 all: $(BUILD)/trawl $(BUILD)/libtrawl_shim.so
 
 $(BUILD):
@@ -41,3 +41,15 @@ examples: all
 clean:
 	rm -rf $(BUILD)
 	$(MAKE) -C examples clean
+
+docker-build:
+	./scripts/docker-build.sh
+
+docker-demo:
+	./scripts/run-demo.sh
+
+docker-auto:
+	./scripts/run-auto.sh
+
+docker-smoke:
+	./scripts/smoke-test.sh

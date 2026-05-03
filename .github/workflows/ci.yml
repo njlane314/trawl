@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install script tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh
+
+      - name: Build Docker image
+        run: docker build -t trawl-dev .
+
+      - name: Compile in Docker
+        run: |
+          docker run --rm \
+            -v "$PWD":/src \
+            -w /src \
+            trawl-dev \
+            bash -lc 'make clean && make ARCH=x86 && make ARCH=x86 examples'

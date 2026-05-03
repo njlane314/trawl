@@ -1,6 +1,8 @@
 .git/
 build/
 examples/demo_server
+examples/sleep_bound_server
+reports/
 
 *.o
 *.so

@@ -28,11 +28,14 @@ include/
   trawl_marker.h       # app-facing marker macros
   trawl_shm.h          # shared-memory pause-debt table
 examples/
-  demo_server.c      # toy multithreaded workload with throughput and latency markers
+  demo_server.c        # CPU-heavy multithreaded workload with throughput and latency markers
+  sleep_bound_server.c # workload where sleeping dominates target_work
 scripts/
-  docker-build.sh    # build Linux artifacts in the Docker image
+  docker-build.sh    # build Linux artefacts in the Docker image
   run-demo.sh        # run a targeted target_work causal profile
   run-auto.sh        # run auto-discovery against the demo workload
+  run-sleep-demo.sh  # run the sleep-bound comparison workload
+  smoke-test.sh      # assert that a short profiled run observes work and target hits
 ```
 
 ## Build requirements
@@ -60,25 +63,46 @@ On macOS, build inside a Linux environment such as Docker or on a Linux host. Th
 
 ## Docker quick start
 
-Build the Linux container image and artifacts:
+Build the Linux container image and artefacts:
 
 ```sh
 ./scripts/docker-build.sh
+make docker-build
 ```
 
 Run a targeted demo experiment against `target_work`:
 
 ```sh
 ./scripts/run-demo.sh
+make docker-demo
 ```
 
 Run auto-discovery against the demo workload:
 
 ```sh
 ./scripts/run-auto.sh
+make docker-auto
+```
+
+Run the smoke test:
+
+```sh
+./scripts/smoke-test.sh
+make docker-smoke
 ```
 
 The run scripts use `--privileged --pid=host` and set `kernel.perf_event_paranoid=-1` inside the Docker Linux VM when permitted. This is needed for the perf-event and uprobe paths used by the profiler. On a normal Linux host, you can run the `build/trawl` commands directly with root or equivalent `CAP_BPF`/`CAP_PERFMON` privileges.
+
+Each run writes report files under `reports/` by default:
+
+```text
+reports/demo.json
+reports/demo-trials.csv
+reports/demo-candidates.csv
+reports/auto.json
+reports/auto-trials.csv
+reports/auto-candidates.csv
+```
 
 Common run-script overrides:
 
@@ -86,6 +110,13 @@ Common run-script overrides:
 DURATION_MS=10000 REPEATS=20 SPEEDUPS=0,5,10,25,50 ./scripts/run-demo.sh
 TOP_CANDIDATES=10 DISCOVER_MS=5000 REPEATS=10 ./scripts/run-auto.sh
 SEED=42 ./scripts/run-demo.sh
+```
+
+Compare against a workload where sleeping dominates the request:
+
+```sh
+./scripts/run-sleep-demo.sh
+REPORT_NAME=sleep-long DURATION_MS=10000 REPEATS=20 ./scripts/run-sleep-demo.sh
 ```
 
 ## Throughput markers
@@ -145,6 +176,8 @@ sudo ./build/trawl \
 
 The controller prints one CSV row per trial and then a summary table. The summary table contains the mean progress rate, the rate confidence interval, and the estimated impact relative to the baseline trials for the same candidate.
 
+The Docker wrapper writes the same trial rows to `reports/demo-trials.csv` and the machine-readable report to `reports/demo.json`.
+
 ## Auto-discovery mode
 
 Auto mode runs a discovery window, reads `sample_hist`, maps sampled instruction pointers back through `/proc/<pid>/maps`, resolves them to ELF function symbols, attaches source locations with `addr2line`, and selects the hottest functions.
@@ -199,6 +232,26 @@ summary_type,candidate_idx,name,speedup_pct,n,rate_mean,rate_ci95_low,rate_ci95_
 ```
 
 `impact_pct` estimates the application-level throughput effect of virtually speeding up that candidate by the given percentage. The confidence interval is computed on the log rate ratio using the repeated randomised trials.
+
+## How to read results
+
+Start with `progress_count`. If it is zero, the workload did not report completed units of work and the experiment is not meaningful.
+
+Check `target_hits` for non-zero speedup trials. If it is zero, the sampler did not observe execution inside the selected target, so the virtual speedup was not actually exercised.
+
+Use `rate_mean` and `impact_pct` together. `rate_mean` is measured throughput; `impact_pct` is the estimated whole-program throughput change relative to baseline. A hot function is worth optimising only when speeding it up improves the application-level progress rate.
+
+Use `rate_ci95_low`, `rate_ci95_high`, `impact_ci95_low`, and `impact_ci95_high` to judge uncertainty. Wide intervals usually mean the run was too short, had too few repeats, or used an unstable workload.
+
+Use `lat_p50_ms`, `lat_p90_ms`, and `lat_p99_ms` to check whether a throughput gain came with better or worse request latency.
+
+Use `virtual_delay_ms` as a sanity check. It should be positive for non-zero speedup trials with target hits. Very large delay values indicate that the experiment heavily perturbed scheduling.
+
+The sleep-bound demo is useful as a negative-control workload. It still calls `TRAWL_PROGRESS()`, but request time is dominated by `usleep(5000)`, so speeding up `target_work` should have a much smaller whole-program effect than in the CPU-heavy demo.
+
+## Continuous integration
+
+The GitHub Actions workflow builds the Docker image, runs ShellCheck over scripts, and compiles the controller, BPF object, shim, and examples inside the container. It does not run privileged eBPF profiling on GitHub-hosted runners; use `./scripts/smoke-test.sh` locally or in a privileged Linux runner for runtime validation.
 
 ## Interpretation constraints
 
