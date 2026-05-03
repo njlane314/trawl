@@ -7,9 +7,14 @@ case "$0" in
     *) self_dir=$(dirname "$(command -v "$0")") ;;
 esac
 
-if [ "${1:-}" = "studio" ]; then
+if [ "${1:-}" = "repl" ]; then
     shift
-    exec "$self_dir/trawl-studio" --trawl-core "$self_dir/trawlctl" "$@"
+    exec "$self_dir/trawl-repl" --trawl-core "$self_dir/trawlctl" "$@"
+fi
+
+if [ "${1:-}" = "studio" ]; then
+    echo "trawl: the studio TUI was removed; use 'trawl repl' instead" >&2
+    exit 64
 fi
 
 exec "$self_dir/trawlctl" "$@"

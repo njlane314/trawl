@@ -11,7 +11,7 @@ USER_CFLAGS := -g -O2 -Wall -Wextra -I$(BUILD) -Ibpf -Iinclude
 USER_LDLIBS := -lbpf -lelf -lz -pthread -ldl -lm
 
 .PHONY: all clean examples docker-build docker-demo docker-auto docker-smoke
-all: $(BUILD)/trawl $(BUILD)/trawlctl $(BUILD)/trawl-studio $(BUILD)/libtrawl_shim.so
+all: $(BUILD)/trawl $(BUILD)/trawlctl $(BUILD)/trawl-repl $(BUILD)/libtrawl_shim.so
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -32,10 +32,10 @@ $(BUILD)/trawl.skel.h: $(BUILD)/trawl.bpf.o
 $(BUILD)/trawlctl: src/trawlctl.c include/trawl_shm.h bpf/trawl_shared.h $(BUILD)/trawl.skel.h | $(BUILD)
 	$(CC) $(USER_CFLAGS) $< -o $@ $(USER_LDLIBS)
 
-$(BUILD)/trawl-studio: src/trawl_studio.c | $(BUILD)
+$(BUILD)/trawl-repl: src/trawl_repl.c | $(BUILD)
 	$(CC) $(USER_CFLAGS) $< -o $@
 
-$(BUILD)/trawl: scripts/trawl-wrapper.sh $(BUILD)/trawlctl $(BUILD)/trawl-studio | $(BUILD)
+$(BUILD)/trawl: scripts/trawl-wrapper.sh $(BUILD)/trawlctl $(BUILD)/trawl-repl | $(BUILD)
 	cp $< $@
 	chmod +x $@
 
